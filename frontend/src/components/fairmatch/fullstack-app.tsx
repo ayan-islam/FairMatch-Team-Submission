@@ -1,0 +1,451 @@
+"use client";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Toaster, toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Field, LoadingState } from "./shared";
+import { RecruiterWorkspace } from "./recruiter-workspace";
+import { CandidateWorkspace } from "./candidate-workspace";
+import { PlatformAdmin } from "./platform-admin";
+import { AccountSecurity, PasswordRecovery } from "./account-security";
+import { JoinOrganization } from "./team-access";
+import { api, request, type InterviewInput } from "@/lib/api";
+import {
+  platformApi,
+  type User,
+  type Organization,
+  type Member,
+} from "@/lib/platform-api";
+import type {
+  Job,
+  Candidate,
+  Stage,
+  Interview,
+  AuditEvent,
+} from "@/lib/demo-data";
+import "./backend.css";
+import "./recruiter.css";
+import "./platform.css";
+type Workspace = "employer" | "candidate" | "admin";
+const roles = { employer: "EMPLOYER", candidate: "CANDIDATE", admin: "ADMIN" };
+const workspaceCopy: Record<Workspace, { label: string; title: string; description: string }> = {
+  employer: {
+    label: "Employer",
+    title: "Manage hiring for your organization",
+    description: "Create jobs, review applications and record hiring decisions.",
+  },
+  candidate: {
+    label: "Candidate",
+    title: "Manage your job applications",
+    description: "Open shared job links, apply and track every application.",
+  },
+  admin: {
+    label: "Administrator",
+    title: "Review platform activity",
+    description: "Verify organizations, resolve support cases and review audit records.",
+  },
+};
+const workspaceAccountLabel = (workspace: Workspace) =>
+  `${workspace === "employer" || workspace === "admin" ? "an" : "a"} ${workspaceCopy[workspace].label.toLowerCase()} account`;
+export function FullstackApp() {
+  const params = useSearchParams();
+  const [workspace, setWorkspace] = useState<Workspace>(
+    params.get("workspace") === "candidate"
+      ? "candidate"
+      : params.get("workspace") === "admin"
+        ? "admin"
+        : "employer",
+  );
+  const [user, setUser] = useState<User | null>(null);
+  const [auth, setAuth] = useState("");
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [interviews, setInterviews] = useState<Interview[]>([]);
+  const [audit, setAudit] = useState<AuditEvent[]>([]);
+  const [org, setOrg] = useState<Organization>();
+  const [members, setMembers] = useState<Member[]>([]);
+  const [securityOpen, setSecurityOpen] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  function clearSession(all = false) {
+    for (const w of all ? ["employer", "candidate", "admin"] : [workspace]) {
+      sessionStorage.removeItem(`fairmatch.session.${w}`);
+    }
+    setSecurityOpen(false);
+    setUser(null);
+    setAuth("");
+    setRevision(r => r + 1);
+  }
+  async function signOut() {
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      await request("account/logout", "POST", {}, auth);
+      clearSession();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally { setSigningOut(false); }
+  }
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setBusy(true);
+      setError("");
+      try {
+        const token =
+          sessionStorage.getItem(`fairmatch.session.${workspace}`) || "";
+        const me = token ? await platformApi.me(token) : null;
+        if (me && me.role !== roles[workspace])
+          throw new Error("Use an account for this workspace.");
+        if (!cancelled) {
+          setAuth(token);
+          setUser(me);
+          setJobs([]);
+        }
+        if (token && me && workspace === "employer") {
+          const [j, c, i, a, o, m] = await Promise.all([
+            api.employerJobs(token),
+            api.applications(token),
+            api.interviews(token),
+            api.audit(token),
+            platformApi.organization(token),
+            platformApi.members(token),
+          ]);
+          if (!cancelled) {
+            setJobs(j);
+            setCandidates(c);
+            setInterviews(i);
+            setAudit(a);
+            setOrg(o);
+            setMembers(m);
+          }
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError((e as Error).message);
+          setUser(null);
+          setAuth("");
+        }
+      } finally {
+        if (!cancelled) setBusy(false);
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspace, revision]);
+  function change(next: Workspace, job?: Job) {
+    if (next === workspace) {
+      setRevision((r) => r + 1);
+      return;
+    }
+    setUser(null);
+    setAuth("");
+    setSecurityOpen(false);
+    setWorkspace(next);
+    window.history.replaceState(
+      null,
+      "",
+      `/?workspace=${next}${job ? `&job=${encodeURIComponent(job.id)}` : ""}`,
+    );
+    window.scrollTo({ top: 0 });
+  }
+  async function history() {
+    try {
+      setAudit(await api.audit(auth));
+    } catch {
+      /* A committed save remains successful even if history reload fails. */
+    }
+  }
+  async function acceptInterview(saved: Interview) {
+    setInterviews((old) =>
+      [saved, ...old.filter((i) => i.id !== saved.id)].sort((a, b) =>
+        (a.date + a.time).localeCompare(b.date + b.time),
+      ),
+    );
+    await history();
+  }
+  async function saveJob(job: Job) {
+    const saved = await api.saveJob(
+      job,
+      auth,
+      jobs.some((j) => j.id === job.id),
+    );
+    setJobs((old) => [saved, ...old.filter((j) => j.id !== saved.id)]);
+    await history();
+    return saved;
+  }
+  async function move(candidate: Candidate, stage: Stage, reason: string) {
+    const saved = await api.moveCandidate(candidate, stage, reason, auth);
+    setCandidates((old) => old.map((c) => (c.id === saved.id ? saved : c)));
+    await history();
+  }
+  return (
+    <>
+      <div
+        className="fm-live-bar"
+        data-sidebar={workspace === "employer" && !!user}
+      >
+        <span>
+          <strong>FairMatch</strong> ·{" "}
+          {user
+            ? `${user.name} · ${user.role.toLowerCase()}`
+            : "Secure hiring workspace"}
+        </span>
+        <div role="navigation" aria-label="Choose workspace">
+          {(["employer", "candidate", "admin"] as Workspace[]).map((w) => (
+            <button
+              key={w}
+              aria-current={workspace === w ? "page" : undefined}
+              aria-label={`Open ${workspaceCopy[w].label} workspace`}
+              onClick={() => change(w)}
+            >
+              {workspaceCopy[w].label}
+            </button>
+          ))}
+          {user && (
+            <>
+              <button disabled={busy} onClick={() => setRevision((r) => r + 1)}>
+                Refresh data
+              </button>
+              <button disabled={busy} onClick={() => setSecurityOpen(true)}>Account security</button>
+              <button disabled={signingOut} onClick={() => void signOut()}>
+                {signingOut ? "Signing out..." : "Sign out"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+      {error && (
+        <p className="fm-backend-error" role="alert">
+          {error}
+        </p>
+      )}
+      {busy && <LoadingState label="Opening your FairMatch workspace" />}
+      {!busy && !user && (
+        <AccountForm
+          key={workspace}
+          workspace={workspace}
+          onSession={(token) => {
+            sessionStorage.setItem(
+              `fairmatch.session.${workspace}`,
+              `Bearer ${token}`,
+            );
+            setRevision((r) => r + 1);
+          }}
+        />
+      )}
+      {!busy && user && workspace === "employer" && org && (
+        <RecruiterWorkspace
+          key={org.id}
+          jobs={jobs}
+          candidates={candidates}
+          auditEvents={audit}
+          interviews={interviews}
+          organization={org}
+          accountId={user.id}
+          members={members}
+          onOrganizationChanged={setOrg}
+          onSaveOrganization={async (value) => {
+            const saved = await platformApi.saveOrganization(value, auth);
+            setOrg(saved);
+            await history();
+            return saved;
+          }}
+          onReviewCandidate={(saved) => {
+            setCandidates((old) =>
+              old.map((x) => (x.id === saved.id ? saved : x)),
+            );
+            void history().catch(e => setError(e.message));
+          }}
+          onRequestInformation={async (c, message) => {
+            await platformApi.requestInformation(c.id, message, auth);
+            await history();
+          }}
+          auth={auth}
+          onMoveCandidate={move}
+          onSaveJob={saveJob}
+          onScheduleInterview={async (
+            input: InterviewInput,
+            existing?: Interview,
+          ) =>
+            acceptInterview(await api.scheduleInterview(input, auth, existing))
+          }
+          onEvaluateInterview={async (i, s, n) =>
+            acceptInterview(await api.evaluateInterview(i, s, n, auth))
+          }
+          onCancelInterview={async (i, r) =>
+            acceptInterview(await api.cancelInterview(i, r, auth))
+          }
+          onWorkspaceChange={() => change("candidate")}
+          onCandidatePreview={(j) => change("candidate", j)}
+        />
+      )}
+      {!busy && user && workspace === "candidate" && (
+        <CandidateWorkspace
+          key={`${user.id}:${params.get("job") ?? "browse"}`}
+          auth={auth}
+          user={user}
+          requestedId={params.get("job")}
+          onAccountDeleted={() => {
+            clearSession();
+            window.history.replaceState(null, "", "/?workspace=candidate");
+            toast.success("Your candidate account and account-linked data were deleted.");
+          }}
+        />
+      )}
+      {user && workspace === "admin" && <PlatformAdmin auth={auth} />}
+      {user && securityOpen && <AccountSecurity auth={auth} onClose={() => setSecurityOpen(false)} onSignedOut={() => { clearSession(true); toast.success("Sessions signed out. Sign in again to continue."); }} />}
+      <Toaster position="bottom-right" richColors closeButton />
+    </>
+  );
+}
+function AccountForm({
+  workspace,
+  onSession,
+}: {
+  workspace: Workspace;
+  onSession: (token: string) => void;
+}) {
+  const [register, setRegister] = useState(false);
+  const [joining, setJoining] = useState(false);
+  const [username, setUsername] = useState("");
+  const [recovering, setRecovering] = useState(false);
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [contact, setContact] = useState("");
+  const [company, setCompany] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const session = register
+        ? await platformApi.register({
+            username,
+            password,
+            name,
+            contact,
+            organizationName: company,
+            role: roles[workspace],
+          })
+        : await platformApi.login(username, password);
+      if (session.user.role !== roles[workspace]) {
+        await request("account/logout", "POST", {}, `Bearer ${session.token}`);
+        throw new Error(`This account belongs to the ${session.user.role.toLowerCase()} workspace.`);
+      }
+      setPassword("");
+      onSession(session.token);
+      toast.success(register ? "Account created." : "Signed in.");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  if (joining) return <JoinOrganization onSession={onSession} onBack={() => setJoining(false)} />;
+  return (
+    <main className="fm-login" id="main-content">
+      <div className="fm-login-header">
+        <span className="fm-login-brand">FairMatch<span>.</span></span>
+        <span className="fm-login-role">{workspaceCopy[workspace].label} workspace</span>
+      </div>
+      <h1>{register ? `Create your ${workspaceCopy[workspace].label.toLowerCase()} account` : workspaceCopy[workspace].title}</h1>
+      <p>{register ? workspaceCopy[workspace].description : `Sign in to continue. ${workspaceCopy[workspace].description}`}</p>
+      <form onSubmit={submit}>
+        <Field
+          label={workspace === "candidate" ? "Candidate username" : workspace === "admin" ? "Administrator username" : "Employer username"}
+          hint={register ? "Start with a letter; use 3–60 letters, numbers, dots, underscores or hyphens." : undefined}
+        >
+          <Input
+            required
+            minLength={register ? 3 : undefined}
+            maxLength={60}
+            pattern={register ? "[A-Za-z][A-Za-z0-9._-]{2,59}" : undefined}
+            title={register ? "Start with a letter and use 3–60 letters, numbers, dots, underscores or hyphens." : undefined}
+            autoComplete="username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+        </Field>
+        <Field label="Password">
+          <Input
+            required
+            minLength={register ? 10 : undefined}
+            maxLength={72}
+            type="password"
+            autoComplete={register ? "new-password" : "current-password"}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+        {register && (
+          <>
+            <Field label="Your name">
+              <Input
+                required
+                maxLength={160}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </Field>
+            <Field label="Email">
+              <Input
+                required
+                type="email"
+                maxLength={160}
+                value={contact}
+                onChange={(e) => setContact(e.target.value)}
+              />
+            </Field>
+            {workspace === "employer" && (
+              <Field label="Organization name">
+                <Input
+                  required
+                  maxLength={160}
+                  value={company}
+                  onChange={(e) => setCompany(e.target.value)}
+                />
+              </Field>
+            )}
+            <p>
+              Use a password of at least 10 characters. You can check email
+              verification availability in Account security after signing in.
+            </p>
+          </>
+        )}
+        {error && (
+          <p className="fm-error" role="alert">
+            {error}
+          </p>
+        )}
+        <Button disabled={busy}>
+          {busy ? "Please wait..." : register ? `Create ${workspaceAccountLabel(workspace)}` : `Sign in to ${workspaceCopy[workspace].label.toLowerCase()} workspace`}
+        </Button>
+      </form>
+      <div className="fm-login-actions">
+        {workspace !== "admin" && (
+          <Button
+            variant="ghost"
+            onClick={() => {
+              setRegister(!register);
+              setError("");
+            }}
+          >
+            {register ? "I already have an account" : `Create ${workspaceAccountLabel(workspace)}`}
+          </Button>
+        )}
+        {!register && <Button variant="ghost" onClick={() => setRecovering(true)}>Forgot password?</Button>}
+        {workspace === "employer" && <Button variant="ghost" onClick={() => setJoining(true)}>Join an organization</Button>}
+      </div>
+      {recovering && <PasswordRecovery onClose={() => setRecovering(false)} />}
+    </main>
+  );
+}

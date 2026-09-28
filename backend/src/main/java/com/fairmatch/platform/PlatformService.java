@@ -1,0 +1,265 @@
+package com.fairmatch.platform;
+
+import com.fairmatch.audit.AuditService;
+import com.fairmatch.common.ApiException;
+import jakarta.annotation.PostConstruct;
+import jakarta.validation.constraints.*;
+import java.time.Instant;
+import java.util.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.FindAndModifyOptions;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.core.query.*;
+import org.springframework.data.domain.Sort;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.core.userdetails.*;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+/** Shared identity, organization, inbox and support foundation. No hiring decisions live here. */
+@Service
+public class PlatformService implements UserDetailsService {
+    private final MongoTemplate mongo;
+    private final PasswordEncoder passwords;
+    private final AuditService audit;
+    private final OrganizationEvidenceService evidence;
+    private final EmailQueue email;
+    private final String publicUrl;
+    private final String employerUsername, employerPassword, adminPassword;
+    public PlatformService(MongoTemplate mongo, PasswordEncoder passwords, AuditService audit,OrganizationEvidenceService evidence,EmailQueue email,
+        @Value("${fairmatch.demo.username}") String username,@Value("${fairmatch.demo.password}") String password,
+        @Value("${fairmatch.admin.password:LocalTestAdmin!2026}") String adminPassword,
+        @Value("${fairmatch.public-url:http://127.0.0.1:3000}") String publicUrl) {
+        this.mongo=mongo;this.passwords=passwords;this.audit=audit;
+        this.evidence=evidence;this.email=email;this.publicUrl=publicUrl.replaceAll("/+$","");
+        this.employerUsername=username;this.employerPassword=password;this.adminPassword=adminPassword;
+    }
+    @Value("${fairmatch.bootstrap.demo-enabled:false}") private boolean demoEnabled;
+    @PostConstruct void seedAccounts() {
+        if (!demoEnabled) return;
+        seed(employerUsername,"recruiter@fairmatch.local","Rafiq Karim","EMPLOYER","apex-textiles",employerPassword);
+        seed("admin","admin@fairmatch.local","Platform Administrator","ADMIN",null,adminPassword);
+        if (!mongo.exists(Query.query(Criteria.where("_id").is("apex-textiles")),Organization.class))
+            mongo.insert(new Organization("apex-textiles","Apex Textiles Ltd.","Apparel & Textiles","Dhaka, Bangladesh","",
+                "recruiter@fairmatch.local","Verified","Classroom seed organization; not an external business verification.",Instant.now(),0,false));
+    }
+    private void seed(String username,String contact,String name,String role,String organization,String password) {
+        if (!mongo.exists(Query.query(Criteria.where("username").is(username)),Account.class))
+            mongo.insert(new Account(UUID.randomUUID().toString(),username,contact,name,role,organization,passwords.encode(password),Instant.now()));
+    }
+    @Override public UserDetails loadUserByUsername(String username) {
+        var account=mongo.findOne(Query.query(Criteria.where("username").is(username.toLowerCase(Locale.ROOT))),Account.class);
+        if(account==null)throw new UsernameNotFoundException("Invalid credentials.");
+        return User.withUsername(account.username()).password(account.passwordHash()).roles(account.role()).disabled(!membershipActive(account)).build();
+    }
+    public Account account(String username) {
+        var result=mongo.findOne(Query.query(Criteria.where("username").is(username)),Account.class);
+        if(result==null)throw new ApiException(HttpStatus.UNAUTHORIZED,"Sign in again.");return result;
+    }
+    public String organizationId(String username) {
+        var a=account(username);
+        if(!a.role().equals("EMPLOYER")||a.organizationId()==null||!membershipActive(a))throw new ApiException(HttpStatus.FORBIDDEN,"Active employer membership required. Contact the organization owner.");
+        return a.organizationId();
+    }
+    public boolean membershipActive(Account a) {
+        return !a.role().equals("EMPLOYER") || !mongo.exists(Query.query(Criteria.where("_id").is(a.id()).and("status").is("Suspended")),"team_access");
+    }
+    public Account organizationOwner(String org) {
+        var ownership=mongo.findById(org,Ownership.class);
+        if(ownership==null) {
+            // Migrate the original employer once; later joins never change ownership.
+            var first=mongo.findOne(Query.query(Criteria.where("organizationId").is(org).and("role").is("EMPLOYER")).with(Sort.by("createdAt","_id")),Account.class);
+            if(first==null)throw new ApiException(HttpStatus.CONFLICT,"Organization owner is unavailable. Contact support.");
+            ownership=mongo.findAndModify(Query.query(Criteria.where("_id").is(org)),new Update().setOnInsert("ownerId",first.id()),FindAndModifyOptions.options().upsert(true).returnNew(true),Ownership.class);
+        }
+        var owner=mongo.findById(ownership.ownerId(),Account.class);
+        if(owner==null||!org.equals(owner.organizationId()))throw new ApiException(HttpStatus.CONFLICT,"Organization owner is unavailable. Contact support.");
+        return owner;
+    }
+    public String requireOrganizationOwner(String username) {
+        var org=organizationId(username);
+        if(!organizationOwner(org).username().equals(username))throw new ApiException(HttpStatus.FORBIDDEN,"Only the organization owner can manage the team, organization profile and verification documents.");
+        return org;
+    }
+    public Account login(String username,String password) {
+        var a=mongo.findOne(Query.query(Criteria.where("username").is(username.trim().toLowerCase(Locale.ROOT))),Account.class);
+        if(a==null || !passwords.matches(password,a.passwordHash()))throw new ApiException(HttpStatus.UNAUTHORIZED,"Incorrect username or password.");
+        if(!membershipActive(a))throw new ApiException(HttpStatus.FORBIDDEN,"Your organization access is suspended. Contact the organization owner.");
+        return a;
+    }
+    @Transactional public Account register(Registration r) {
+        if(r.password().getBytes(java.nio.charset.StandardCharsets.UTF_8).length>72)bad("Password must be at most 72 UTF-8 bytes.");
+        var username=r.username()==null?"":r.username().trim().toLowerCase(Locale.ROOT);
+        var contact=r.contact().trim().toLowerCase(Locale.ROOT);
+        if(!username.matches("[a-z][a-z0-9._-]{2,59}"))
+            bad("Usernames must start with a letter and contain 3–60 letters, numbers, dots, underscores or hyphens.");
+        if(mongo.exists(Query.query(Criteria.where("username").is(username)),Account.class))
+            throw new ApiException(HttpStatus.CONFLICT,"This username already has an account.");
+        if(mongo.exists(Query.query(Criteria.where("contact").is(contact)),Account.class))
+            throw new ApiException(HttpStatus.CONFLICT,"This email already has an account.");
+        if(r.name().isBlank())bad("Enter your name.");
+        String org=null;
+        if(r.role().equals("EMPLOYER")) {
+            if(r.organizationName()==null||r.organizationName().trim().length()<2)bad("Enter your organization name.");
+            org="ORG-"+UUID.randomUUID();
+            mongo.insert(new Organization(org,r.organizationName().trim(),"","","",contact,"Pending","",Instant.now(),0,false));
+        }
+        var account=mongo.insert(new Account(UUID.randomUUID().toString(),username,contact,r.name().trim(),r.role(),org,passwords.encode(r.password()),Instant.now()));
+        if(org!=null)mongo.insert(new Ownership(org,account.id()));
+        audit.record(org==null?"platform":org,"ACCOUNT_CREATED",account.id(),r.role(),username);
+        return account;
+    }
+    public Organization organization(String id) {
+        var org=mongo.findById(id,Organization.class);if(org==null)throw new ApiException(HttpStatus.NOT_FOUND,"Organization not found.");return org;
+    }
+    public void requireVerified(String id) {
+        if(!organization(id).status().equals("Verified"))throw new ApiException(HttpStatus.CONFLICT,"Your organization must be verified by an administrator before publishing jobs.");
+    }
+    @Transactional public Organization saveOrganization(String id,OrganizationInput r,String actor) {
+        if(!requireOrganizationOwner(actor).equals(id))throw new ApiException(HttpStatus.FORBIDDEN,"Organization owner required.");
+        var old=organization(id);
+        if(r.name().trim().length()<2)bad("Enter an organization name.");
+        var nameChanged=!old.name().equals(r.name().trim()) && !old.status().equals("Cancelled");
+        var saved=new Organization(id,r.name().trim(),r.industry().trim(),r.location().trim(),r.website().trim(),old.contact(),
+            nameChanged?"Pending":old.status(),nameChanged?"Organization name changed. Administrator review required.":old.reviewReason(),old.submittedAt(),old.version()+1,
+            nameChanged?false:old.clearedFromAdmin());
+        var changed=mongo.updateFirst(Query.query(Criteria.where("_id").is(id).and("version").is(r.expectedVersion())),
+            new Update().set("name",saved.name()).set("industry",saved.industry()).set("location",saved.location()).set("website",saved.website())
+                .set("status",saved.status()).set("reviewReason",saved.reviewReason()).set("clearedFromAdmin",saved.clearedFromAdmin()).inc("version",1),Organization.class);
+        if(changed.getModifiedCount()!=1)conflict();
+        audit.record(id,"ORGANIZATION_UPDATED",id,null,actor);return saved;
+    }
+    public List<Organization> organizations() { return mongo.find(new Query().with(Sort.by(Sort.Direction.DESC,"submittedAt")),Organization.class); }
+    @Transactional public Organization cancelVerification(String id,long expectedVersion,String reason,String actor) {
+        if(reason==null||reason.trim().length()<20)bad("Explain the cancellation in at least 20 characters.");
+        var changed=mongo.updateFirst(Query.query(Criteria.where("_id").is(id).and("version").is(expectedVersion).and("status").is("Pending")),
+            new Update().set("status","Cancelled").set("reviewReason",reason.trim()).set("clearedFromAdmin",false).inc("version",1),Organization.class);
+        if(changed.getModifiedCount()!=1)throw new ApiException(HttpStatus.CONFLICT,"Only a current pending verification request can be cancelled. Refresh and try again.");
+        evidence.recordReview(id,expectedVersion+1,"Cancelled",reason.trim(),List.of(),actor);
+        audit.record(id,"ORGANIZATION_VERIFICATION_CANCELLED",id,reason.trim(),actor);
+        notifyOrganization(id,"Verification request cancelled",reason.trim(),id);
+        return organization(id);
+    }
+    @Transactional public Organization reopenVerification(String id,long expectedVersion,String reason,String actor) {
+        if(reason==null||reason.trim().length()<20)bad("Explain why this request is being reopened in at least 20 characters.");
+        var changed=mongo.updateFirst(Query.query(Criteria.where("_id").is(id).and("version").is(expectedVersion).and("status").is("Cancelled")),
+            new Update().set("status","Pending").set("reviewReason",reason.trim()).set("clearedFromAdmin",false).set("submittedAt",Instant.now()).inc("version",1),Organization.class);
+        if(changed.getModifiedCount()!=1)throw new ApiException(HttpStatus.CONFLICT,"Only a current cancelled verification request can be reopened. Refresh and try again.");
+        audit.record(id,"ORGANIZATION_VERIFICATION_REOPENED",id,reason.trim(),actor);
+        notifyOrganization(id,"Verification request reopened",reason.trim(),id);
+        return organization(id);
+    }
+    @Transactional public long clearCancelledOrganizations(String actor) {
+        var changed=mongo.updateMulti(Query.query(Criteria.where("status").is("Cancelled").and("clearedFromAdmin").ne(true)),
+            new Update().set("clearedFromAdmin",true),Organization.class);
+        audit.record("platform","CANCELLED_ORGANIZATIONS_CLEARED","all","Archived "+changed.getModifiedCount()+" cancelled verification requests from the admin list",actor);
+        return changed.getModifiedCount();
+    }
+    @Transactional public Organization verify(String id,OrganizationDecision r,String actor) {
+        if(!Set.of("Verified","Changes requested").contains(r.status()))bad("Choose a verification decision.");
+        if(!r.reviewed()||r.reason().trim().length()<20)bad("Review the organization and record at least 20 characters of reasoning.");
+        var old=organization(id);
+        if(old.status().equals("Cancelled"))throw new ApiException(HttpStatus.CONFLICT,"This verification request was cancelled. An administrator must reopen it before review.");
+        var changed=mongo.updateFirst(Query.query(Criteria.where("_id").is(id).and("version").is(r.expectedVersion())),
+            new Update().set("status",r.status()).set("reviewReason",r.reason().trim()).inc("version",1),Organization.class);
+        if(changed.getModifiedCount()!=1)conflict();
+        evidence.recordReview(id,old.version()+1,r.status(),r.reason().trim(),r.reviewedDocumentIds(),actor);
+        audit.record(id,"ORGANIZATION_"+r.status().toUpperCase(Locale.ROOT).replace(' ','_'),id,r.reason().trim(),actor);
+        mongo.find(Query.query(Criteria.where("organizationId").is(id)),Account.class).forEach(a->notify(a.id(),"Organization review",r.status()+": "+r.reason().trim(),id));
+        return organization(old.id());
+    }
+    public List<Member> members(String id) {
+        var owner=organizationOwner(id).id();
+        return mongo.find(Query.query(Criteria.where("organizationId").is(id)),Account.class).stream()
+            .map(a->new Member(a.id(),a.name(),a.contact(),owner.equals(a.id())?"Owner":"Recruiter",membershipActive(a)?"Active":"Suspended")).toList();
+    }
+    public void notify(String ownerId,String title,String message,String reference) {
+        if(ownerId==null)return;
+        mongo.insert(new Notification(UUID.randomUUID().toString(),ownerId,title,message,reference,Instant.now(),false));
+        var account=mongo.findById(ownerId,Account.class);
+        boolean verified=account!=null&&mongo.exists(Query.query(Criteria.where("_id").is(ownerId).and("contact").is(account.contact())),AccountSecurityService.Verification.class);
+        if(verified)email.enqueueIfConfigured(account.contact(),"FairMatch: "+title,
+            "Hello "+account.name()+",\n\n"+message+"\n\nReference: "+(reference==null||reference.isBlank()?"Not provided":reference)+
+            "\n\nOpen FairMatch: "+publicUrl+"\n\nThis is a transactional account notification from FairMatch.",Instant.now().plusSeconds(7*86400));
+    }
+    public void notifyOrganization(String org,String title,String message,String reference) {
+        mongo.find(Query.query(Criteria.where("organizationId").is(org)),Account.class).forEach(a->notify(a.id(),title,message,reference));
+    }
+    public List<Notification> notifications(String ownerId) {
+        return mongo.find(Query.query(Criteria.where("ownerId").is(ownerId)).with(Sort.by(Sort.Direction.DESC,"createdAt")).limit(200),Notification.class);
+    }
+    public void markRead(String ownerId,String id) {
+        if(mongo.updateFirst(Query.query(Criteria.where("_id").is(id).and("ownerId").is(ownerId)),new Update().set("read",true),Notification.class).getMatchedCount()!=1)
+            throw new ApiException(HttpStatus.NOT_FOUND,"Notification not found.");
+    }
+    public Profile profile(String ownerId) {
+        var p=mongo.findById(ownerId,Profile.class);return p==null?new Profile(ownerId,"","","",List.of(),null,null):p;
+    }
+    public Profile saveProfile(String ownerId,ProfileInput r) {
+        var existing=profile(ownerId);
+        return mongo.save(new Profile(ownerId,r.role().trim(),r.experience().trim(),r.education().trim(),r.skills().stream().map(String::trim).filter(s->!s.isEmpty()).distinct().toList(),Instant.now(),existing.cvSummary()));
+    }
+    public Profile saveConfirmedCvProfile(String ownerId,ProfileInput r,CvSummary summary) {
+        var saved=saveProfile(ownerId,r);
+        return mongo.save(new Profile(saved.id(),saved.role(),saved.experience(),saved.education(),saved.skills(),saved.updatedAt(),summary));
+    }
+    public Draft draft(String ownerId,String jobId) {
+        var d=mongo.findById(ownerId+":"+jobId,Draft.class);return d==null?new Draft(ownerId+":"+jobId,ownerId,jobId,Map.of(),null):d;
+    }
+    public Draft saveDraft(String ownerId,String jobId,Map<String,Object> values) {
+        if(values.size()>20 || values.toString().length()>25000)bad("Draft is too large.");
+        var allowed=Set.of("role","experience","education","skills","example","availability","location");
+        if(!allowed.containsAll(values.keySet()))bad("Unsupported draft fields.");
+        values.forEach((key,value)->{
+            if(key.equals("skills")) {
+                if(!(value instanceof List<?> list)||list.size()>30||list.stream().anyMatch(v->!(v instanceof String text)||text.length()>100))bad("Draft skills must be a list of up to 30 short text values.");
+            } else if(!(value instanceof String text)||text.length()>6000)bad("Draft fields must contain text of at most 6000 characters.");
+        });
+        return mongo.save(new Draft(ownerId+":"+jobId,ownerId,jobId,values,Instant.now()));
+    }
+    @Transactional public SupportCase createCase(Account owner,CaseInput r) {
+        if(r.detail().trim().length()<20)bad("Describe your request in at least 20 characters.");
+        var saved=mongo.insert(new SupportCase("CASE-"+UUID.randomUUID(),owner.id(),r.subject().trim(),r.category(),r.reference(),"Normal","Open",r.detail().trim(),"",Instant.now(),0));
+        audit.record("platform","SUPPORT_CASE_OPENED",saved.id(),r.category(),owner.username());return saved;
+    }
+    public List<SupportCase> cases(String ownerId) {
+        var query=ownerId==null?new Query():Query.query(Criteria.where("ownerId").is(ownerId));
+        return mongo.find(query.with(Sort.by(Sort.Direction.DESC,"createdAt")),SupportCase.class);
+    }
+    @Transactional public SupportCase resolveCase(String id,Decision r,String actor) {
+        if(!Set.of("In review","Resolved").contains(r.status())||r.reason().trim().length()<20)bad("Choose a status and add a useful response.");
+        var old=mongo.findById(id,SupportCase.class);if(old==null)throw new ApiException(HttpStatus.NOT_FOUND,"Case not found.");
+        var changed=mongo.updateFirst(Query.query(Criteria.where("_id").is(id).and("version").is(r.expectedVersion())),
+            new Update().set("status",r.status()).set("response",r.reason().trim()).inc("version",1),SupportCase.class);
+        if(changed.getModifiedCount()!=1)conflict();
+        notify(old.ownerId(),"Support request updated",r.reason().trim(),id);
+        audit.record("platform","SUPPORT_CASE_UPDATED",id,r.reason().trim(),actor);return mongo.findById(id,SupportCase.class);
+    }
+    public List<AuditService.Entry> allAudit() { return mongo.find(new Query().with(Sort.by(Sort.Direction.DESC,"at")).limit(300),AuditService.Entry.class); }
+    private void bad(String message){throw new ApiException(HttpStatus.BAD_REQUEST,message);}
+    private void conflict(){throw new ApiException(HttpStatus.CONFLICT,"This record changed. Refresh and try again.");}
+
+    @Document("accounts") public record Account(@Id String id,@Indexed(unique=true) String username,@Indexed(unique=true) String contact,String name,String role,String organizationId,String passwordHash,Instant createdAt) {
+        public UserView view(){return new UserView(id,username,contact,name,role,organizationId);}
+    }
+    public record UserView(String id,String username,String contact,String name,String role,String organizationId){}
+    public record Registration(@NotBlank(message="Username is required.") @Pattern(regexp="[a-zA-Z][a-zA-Z0-9._-]{2,59}",message="Username must start with a letter and contain 3–60 letters, numbers, dots, underscores or hyphens.") String username,@NotBlank(message="Email is required.") @Email(message="Enter a valid email address.") @Size(max=160,message="Email must be at most 160 characters.") String contact,@NotBlank(message="Name is required.") @Size(max=160,message="Name must be at most 160 characters.") String name,@NotBlank(message="Password is required.") @Size(min=10,max=72,message="Password must contain 10–72 characters.") String password,@Pattern(regexp="CANDIDATE|EMPLOYER",message="Choose candidate or employer registration.") @NotNull String role,@Size(max=160,message="Organization name must be at most 160 characters.") String organizationName){}
+    @Document("organizations") public record Organization(@Id String id,String name,String industry,String location,String website,String contact,String status,String reviewReason,Instant submittedAt,long version,Boolean clearedFromAdmin){}
+    public record OrganizationVerificationAction(@Min(0) long expectedVersion,@NotBlank @Size(min=20,max=2000) String reason){}
+    public record OrganizationInput(@NotBlank @Size(max=160) String name,@NotNull @Size(max=160) String industry,@NotNull @Size(max=160) String location,@NotNull @Size(max=240) String website,@Min(0) long expectedVersion){}
+    public record Decision(@NotBlank String status,@NotBlank @Size(max=2000) String reason,boolean reviewed,@Min(0) long expectedVersion){}
+    public record OrganizationDecision(@NotBlank String status,@NotBlank @Size(max=2000) String reason,boolean reviewed,@Min(0) long expectedVersion,@Size(max=5) List<String> reviewedDocumentIds){}
+    @Document("organization_owners") public record Ownership(@Id String id,String ownerId){}
+    public record Member(String id,String name,String email,String role,String status){}
+    @Document("notifications") public record Notification(@Id String id,@Indexed String ownerId,String title,String message,String reference,Instant createdAt,boolean read){}
+    @Document("profiles") public record Profile(@Id String id,String role,String experience,String education,List<String> skills,Instant updatedAt,CvSummary cvSummary){}
+    public record CvSummary(List<String> skills,List<String> courses,List<String> projects,Instant confirmedAt){}
+    public record ProfileInput(@NotNull @Size(max=160) String role,@NotNull @Size(max=6000) String experience,@NotNull @Size(max=1000) String education,@NotNull @Size(max=30) List<@NotBlank @Size(max=100) String> skills){}
+    @Document("application_drafts") public record Draft(@Id String id,@Indexed String ownerId,String jobId,Map<String,Object> values,Instant updatedAt){}
+    @Document("support_cases") public record SupportCase(@Id String id,@Indexed String ownerId,String subject,String category,String reference,String priority,String status,String detail,String response,Instant createdAt,long version){}
+    public record CaseInput(@NotBlank @Size(max=160) String subject,@NotBlank @Pattern(regexp="Candidate appeal|Trust & safety|Privacy|Employer support") String category,@NotNull @Size(max=160) String reference,@NotBlank @Size(min=20,max=5000) String detail){}
+}
